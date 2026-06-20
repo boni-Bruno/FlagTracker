@@ -4,9 +4,25 @@
  * Execução: javascript: $.getScript('URL_DO_SCRIPT')
  *
  * CHANGELOG
+ * v3.3.0 (2026-06-20)
+ *   - Filtro de grupos agora cobre TODOS os grupos (dinâmicos + manuais),
+ *     lidos da barra "Grupos:" em mode=groups&type=static (a[data-group-id]),
+ *     que lista os dois tipos juntos com o ID real de cada um.
+ * v3.2.0 (2026-06-20)
+ *   - Busca por nome substituída por filtro de Grupos (dinâmicos, lidos de
+ *     screen=overview_villages&mode=groups&type=dynamic). Ao selecionar um
+ *     grupo, busca os membros via mode=prod&group=ID e filtra a tabela já
+ *     carregada (sem refazer as requisições de bandeira/edifícios).
+ *   - OBS: cobre apenas grupos dinâmicos por enquanto; grupos manuais
+ *     (type=static) podem ser adicionados se Bruno também usar esse tipo.
+ * v3.1.0 (2026-06-20)
+ *   - Armazém e Fazenda agora mostram a quantidade completa (ex: 400.000),
+ *     em vez da abreviação "k".
+ *   - Coluna Aldeia sem quebra de linha (white-space:nowrap) + scroll
+ *     horizontal no painel pra acomodar nomes longos.
  * v3.0.0 (2026-06-20)
- *   - Novas colunas: Pontos, Armazém (nível + capacidade em k), Fazenda
- *     (nível + capacidade de população em k), Academia (nível), Bandeira
+ *   - Novas colunas: Pontos, Armazém (nível + capacidade), Fazenda
+ *     (nível + capacidade de população), Academia (nível), Bandeira
  *     (ícone + nome + percentual do bônus).
  *   - Todos os dados de edifício/pontos vêm do bloco "var game_data" já
  *     embutido na própria resposta de screen=flags&village=ID (mesma
@@ -28,7 +44,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '3.0.0';
+  const SCRIPT_VERSION = '3.3.0';
   const REQUEST_DELAY_MS = 300;
   console.log(`[FlagViewer] v${SCRIPT_VERSION} iniciando...`);
 
@@ -61,15 +77,16 @@
         <span id="fv-close" style="cursor:pointer; font-weight:bold; padding:0 6px;">✕</span>
       </div>
       <div style="padding:8px 12px; border-bottom:1px solid ${colors.border}; display:flex; gap:8px; align-items:center;">
-        <input id="fv-search" type="text" placeholder="Buscar aldeia... (em breve: filtro por grupos)"
-            style="flex:1; padding:4px 6px; border:1px solid ${colors.border}; border-radius:3px;">
+        <select id="fv-filter-group" style="flex:1; padding:4px 6px; border:1px solid ${colors.border}; border-radius:3px;">
+          <option value="">Todas as aldeias</option>
+        </select>
         <select id="fv-filter-flag" style="padding:4px 6px; border:1px solid ${colors.border}; border-radius:3px;">
           <option value="">Todas as bandeiras</option>
           <option value="__none__">Sem bandeira</option>
         </select>
         <span id="fv-status" style="white-space:nowrap; color:#603000;">Carregando lista de aldeias...</span>
       </div>
-      <div style="max-height:65vh; overflow-y:auto;">
+      <div style="max-height:65vh; overflow-y:auto; overflow-x:auto;">
         <table id="fv-table" style="width:100%; border-collapse:collapse;">
           <thead>
             <tr style="background:${colors.header}; color:${colors.gold}; text-shadow:0 1px 1px #000;">
@@ -127,11 +144,10 @@
     return `game.php?village=${id}&screen=overview`;
   }
 
-  function formatK(n) {
+  function formatFull(n) {
     const num = Number(n);
     if (n === null || n === undefined || isNaN(num)) return '?';
-    if (num >= 1000) return Math.round(num / 1000) + 'k';
-    return String(num);
+    return num.toLocaleString('pt-BR');
   }
 
   function formatPoints(n) {
@@ -163,6 +179,52 @@
       });
     });
     return list;
+  }
+
+  function parseGroupList(html) {
+    const doc = parseDoc(html);
+    const groups = [];
+    $(doc).find('a.group-menu-item[data-group-id]').each(function () {
+      const id = $(this).attr('data-group-id');
+      let name = $(this).text().trim().replace(/^\[/, '').replace(/\]$/, '').trim();
+      if (id && name) groups.push({ id: String(id), name });
+    });
+    return groups;
+  }
+
+  let currentGroupMemberIds = null; // null = sem filtro de grupo (todas as aldeias)
+
+  function loadGroups() {
+    // a barra "Grupos:" (dinâmicos + manuais juntos, com IDs reais) aparece
+    // na página type=static
+    $.get(`game.php?village=${game_data.village.id}&screen=overview_villages&mode=groups&type=static`, function (html) {
+      const groups = parseGroupList(html);
+      groups.forEach(g => {
+        $('#fv-filter-group').append(`<option value="${g.id}">${escapeHtml(g.name)}</option>`);
+      });
+      console.log('[FlagViewer] Grupos encontrados:', groups.length);
+    }).fail(function () {
+      console.warn('[FlagViewer] Falha ao carregar lista de grupos.');
+    });
+  }
+
+  function applyGroupFilter(groupId) {
+    if (!groupId) {
+      currentGroupMemberIds = null;
+      renderTable();
+      return;
+    }
+    $('#fv-status').text('Filtrando por grupo...');
+    $.get(`game.php?village=${game_data.village.id}&screen=overview_villages&mode=prod&group=${groupId}`, function (html) {
+      const members = parseVillageList(html);
+      currentGroupMemberIds = new Set(members.map(v => v.id));
+      renderTable();
+      $('#fv-status').text(`${villages.length} aldeia(s)`);
+    }).fail(function () {
+      console.warn('[FlagViewer] Falha ao filtrar pelo grupo', groupId);
+      currentGroupMemberIds = null;
+      renderTable();
+    });
   }
 
   // ---------------------------------------------------------------------
@@ -275,14 +337,13 @@
   }
 
   function renderTable() {
-    const search = ($('#fv-search').val() || '').toLowerCase();
     const flagFilter = $('#fv-filter-flag').val();
 
     let filtered = villages.filter(v => {
-      const matchSearch = !search || v.name.toLowerCase().includes(search);
+      const matchGroup = !currentGroupMemberIds || currentGroupMemberIds.has(v.id);
       const matchFlag = !flagFilter ||
         (flagFilter === '__none__' ? (v.loaded && !v.flagName) : v.flagName === flagFilter);
-      return matchSearch && matchFlag;
+      return matchGroup && matchFlag;
     });
 
     filtered.sort((a, b) => {
@@ -298,21 +359,21 @@
 
       if (!v.loaded) {
         return `<tr style="background:${bg};">
-          <td style="padding:5px 6px;"><a href="${buildVillageLink(v.id)}" style="color:#603000; font-weight:bold; text-decoration:none;">${escapeHtml(v.name)}</a></td>
+          <td style="padding:5px 6px; white-space:nowrap;"><a href="${buildVillageLink(v.id)}" style="color:#603000; font-weight:bold; text-decoration:none;">${escapeHtml(v.name)}</a></td>
           <td colspan="5" style="padding:5px 6px; color:#999;">carregando...</td>
         </tr>`;
       }
 
       const pointsCell = formatPoints(v.points);
-      const storageCell = `Nível ${v.storageLevel ?? '?'}<br><span style="font-size:10px; color:#5c4322;">(${formatK(v.storageMax)})</span>`;
-      const farmCell = `Nível ${v.farmLevel ?? '?'}<br><span style="font-size:10px; color:#5c4322;">(${formatK(v.popMax)} pop)</span>`;
+      const storageCell = `Nível ${v.storageLevel ?? '?'}<br><span style="font-size:10px; color:#5c4322;">(${formatFull(v.storageMax)})</span>`;
+      const farmCell = `Nível ${v.farmLevel ?? '?'}<br><span style="font-size:10px; color:#5c4322;">(${formatFull(v.popMax)} pop)</span>`;
       const academyCell = `Nível ${v.academyLevel ?? '?'}`;
       const flagCell = v.flagSrc
         ? `<img src="${v.flagSrc}" title="${escapeHtml(v.flagDesc)}" style="height:24px; vertical-align:middle;"> <span style="font-size:11px;">${escapeHtml(v.flagName)}${v.flagPct !== null ? ' (' + v.flagPct + '%)' : ''}</span>`
         : '<span style="color:#888;">— sem bandeira —</span>';
 
       return `<tr style="background:${bg};">
-        <td style="padding:5px 6px;"><a href="${buildVillageLink(v.id)}" style="color:#603000; font-weight:bold; text-decoration:none;">${escapeHtml(v.name)}</a></td>
+        <td style="padding:5px 6px; white-space:nowrap;"><a href="${buildVillageLink(v.id)}" style="color:#603000; font-weight:bold; text-decoration:none;">${escapeHtml(v.name)}</a></td>
         <td style="padding:5px 6px; text-align:right;">${pointsCell}</td>
         <td style="padding:5px 6px; text-align:center;">${storageCell}</td>
         <td style="padding:5px 6px; text-align:center;">${farmCell}</td>
@@ -324,7 +385,7 @@
     $('#fv-tbody').html(rowsHtml || '<tr><td colspan="6" style="padding:10px; text-align:center;">Nenhum resultado</td></tr>');
   }
 
-  $('#fv-search').on('input', renderTable);
+  $('#fv-filter-group').on('change', function () { applyGroupFilter($(this).val()); });
   $('#fv-filter-flag').on('change', renderTable);
   $('#fv-table thead th[data-sort]').on('click', function () {
     const key = $(this).data('sort');
@@ -349,4 +410,6 @@
     $('#fv-status').text('Erro ao carregar lista de aldeias.');
     console.warn('[FlagViewer] Falha na requisição de overview_villages.');
   });
+
+  loadGroups();
 })();
